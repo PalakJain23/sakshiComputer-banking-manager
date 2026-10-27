@@ -3,21 +3,28 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "scripts": {
     "dev": "concurrently -k \"npm:server:dev\" \"npm:client:dev\"",
     "client:dev": "vite",
     "server:dev": "node --env-file-if-exists=.env --watch server/index.js",
     "server": "node --env-file-if-exists=.env server/index.js",
     "start": "node --env-file-if-exists=.env server/index.js",
-    "owner:create": "node --env-file-if-exists=.env server/create-owner.js",
+    "owner:hash": "node --env-file-if-exists=.env server/create-owner.js",
+    "owner:credentials:check": "node --env-file-if-exists=.env server/check-owner-credentials.js",
     "backup": "node --env-file-if-exists=.env server/backup.js",
     "restore": "node --env-file-if-exists=.env server/restore.js",
+    "db:migrate": "node --env-file-if-exists=.env server/migrate-to-turso.js",
     "test:server": "node --test server/*.test.js",
     "build": "vite build",
     "lint": "oxlint",
     "preview": "vite preview"
   },
   "dependencies": {
+    "@libsql/client": "^0.18.0",
+    "@tursodatabase/serverless": "^1.4.1",
     "express": "^5.1.0",
     "express-rate-limit": "^8.1.0",
     "pdfkit": "^0.20.2",

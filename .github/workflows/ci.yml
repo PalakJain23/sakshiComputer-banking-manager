@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Lint, test, and build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Run server and backup tests
+        run: npm run test:server
+        env:
+          NODE_ENV: test
+          DATABASE_PATH: ${{ runner.temp }}/sakshi-ci.sqlite
+          BACKUP_PATH: ${{ runner.temp }}/sakshi-ci-backup.sqlite
+          TURSO_DATABASE_ENGINE: ""
+          TURSO_DATABASE_URL: ""
+          TURSO_AUTH_TOKEN: ""
+
+      - name: Build production frontend
+        run: npm run build

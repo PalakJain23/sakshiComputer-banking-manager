@@ -12,25 +12,26 @@ let livePath
 let snapshotPath
 let frontendDirectory
 
-before(() => {
+before(async () => {
   directory = mkdtempSync(join(tmpdir(), 'sakshi-computer-backup-test-'))
   livePath = join(directory, 'live.sqlite')
   snapshotPath = join(directory, 'backup.sqlite')
   frontendDirectory = fileURLToPath(new URL('..', import.meta.url))
 
-  const database = openDatabase(livePath)
-  createOwner(database, 'backup-owner', 'fictional test passphrase 481')
-  database.prepare(
+  const database = await openDatabase(livePath)
+  await createOwner(database, 'backup-owner', 'fictional test passphrase 481')
+  await database.execute(
     'INSERT INTO applications (id, data, status, submitted_on, account_opened_on, created_at, updated_at) VALUES (?, ?, ?, NULL, NULL, ?, ?)',
-  ).run('backup-test-record', JSON.stringify({ firstName: 'Fictional Backup' }), 'Draft', '2026-10-24', '2026-10-24')
-  database.close()
+    ['backup-test-record', JSON.stringify({ firstName: 'Fictional Backup' }), 'Draft', '2026-10-24', '2026-10-24'],
+  )
+  await database.close()
 })
 
 after(() => {
   rmSync(directory, { recursive: true, force: true })
 })
 
-test('backup and restore commands preserve a separate SQLite test database', () => {
+test('backup and restore commands preserve a separate SQLite test database', async () => {
   const environment = {
     ...process.env,
     DATABASE_PATH: livePath,
@@ -38,22 +39,27 @@ test('backup and restore commands preserve a separate SQLite test database', () 
   }
   execFileSync(process.execPath, ['server/backup.js'], { cwd: frontendDirectory, env: environment })
 
-  const backupDatabase = openDatabase(snapshotPath)
+  const backupDatabase = await openDatabase(snapshotPath)
+  const backupRows = await backupDatabase.execute('SELECT COUNT(*) AS count FROM applications')
   assert.equal(
-    backupDatabase.prepare('SELECT COUNT(*) AS count FROM applications').get().count,
+    Number(backupRows.rows[0].count),
     1,
   )
-  backupDatabase.close()
+  await backupDatabase.close()
 
-  const liveDatabase = openDatabase(livePath)
-  liveDatabase.prepare('DELETE FROM applications').run()
-  liveDatabase.close()
+  const liveDatabase = await openDatabase(livePath)
+  await liveDatabase.execute('DELETE FROM applications')
+  await liveDatabase.close()
   execFileSync(process.execPath, ['server/restore.js', snapshotPath], { cwd: frontendDirectory, env: environment })
 
-  const restoredDatabase = openDatabase(livePath)
+  const restoredDatabase = await openDatabase(livePath)
+  const restoredRows = await restoredDatabase.execute(
+    'SELECT data FROM applications WHERE id = ?',
+    ['backup-test-record'],
+  )
   assert.equal(
-    restoredDatabase.prepare('SELECT data FROM applications WHERE id = ?').get('backup-test-record').data,
+    restoredRows.rows[0].data,
     JSON.stringify({ firstName: 'Fictional Backup' }),
   )
-  restoredDatabase.close()
+  await restoredDatabase.close()
 })

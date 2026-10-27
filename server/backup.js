@@ -1,8 +1,8 @@
-import { backup } from 'node:sqlite'
+import { backup, DatabaseSync } from 'node:sqlite'
 import { mkdirSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { openDatabase, resolveDatabasePath } from './database.js'
+import { resolveDatabasePath } from './database.js'
 
 const serverDirectory = dirname(fileURLToPath(import.meta.url))
 
@@ -11,6 +11,9 @@ function timestamp() {
 }
 
 async function main() {
+  if (process.env.TURSO_DATABASE_URL || process.env.TURSO_AUTH_TOKEN || process.env.NODE_ENV === 'production') {
+    throw new Error('This command backs up local SQLite only. Use `turso db shell <database-name> .dump` for a remote database.')
+  }
   const databasePath = resolveDatabasePath()
   const backupPath = resolve(
     serverDirectory,
@@ -21,7 +24,7 @@ async function main() {
   }
   mkdirSync(dirname(backupPath), { recursive: true })
 
-  const database = openDatabase(databasePath)
+  const database = new DatabaseSync(databasePath, { readOnly: true })
   try {
     await backup(database, backupPath)
   } finally {

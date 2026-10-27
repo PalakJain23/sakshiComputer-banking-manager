@@ -1,13 +1,16 @@
 import { existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { backup, DatabaseSync } from 'node:sqlite'
-import { openDatabase, resolveDatabasePath } from './database.js'
+import { resolveDatabasePath } from './database.js'
 
 function timestamp() {
   return new Date().toISOString().replace(/[:.]/g, '-')
 }
 
 async function main() {
+  if (process.env.TURSO_DATABASE_URL || process.env.TURSO_AUTH_TOKEN || process.env.NODE_ENV === 'production') {
+    throw new Error('This command restores local SQLite only. Restore remote data using a Turso database dump.')
+  }
   const requestedBackup = process.argv[2]
   if (!requestedBackup) throw new Error('Provide the path to a SQLite backup file.')
 
@@ -16,8 +19,6 @@ async function main() {
   if (!existsSync(backupPath)) throw new Error(`Backup file not found: ${backupPath}`)
   if (backupPath === databasePath) throw new Error('The backup file must be different from the live database.')
 
-  const liveDatabase = openDatabase(databasePath)
-  liveDatabase.close()
   const safetyPath = `${databasePath}.pre-restore-${timestamp()}.sqlite`
   const currentDatabase = new DatabaseSync(databasePath)
   try {

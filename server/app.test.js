@@ -5,12 +5,13 @@ import { join } from 'node:path'
 import { after, before, test } from 'node:test'
 import * as pdfjs from 'pdfjs-dist/legacy/build/pdf.mjs'
 import { createApp } from './app.js'
-import { createOwner, openDatabase } from './database.js'
+import { createPasswordHash, ensureConfiguredOwner, openDatabase } from './database.js'
 import { validateApplicationRecord } from './record-fields.js'
 
 const ownerUsername = 'owner-test'
 const ownerPassword = 'correct horse battery staple 614'
 const origin = 'http://127.0.0.1:5173'
+const productionOrigin = 'https://sakshicomputer-banking-manager.onrender.com'
 const requestHeaders = {
   Origin: origin,
   'X-Requested-With': 'SakshiComputerUI',
@@ -53,6 +54,7 @@ let server
 let baseUrl
 let cookie
 let recordId
+let ownerCredentials
 
 async function request(path, options = {}) {
   return fetch(`${baseUrl}${path}`, options)
@@ -61,16 +63,23 @@ async function request(path, options = {}) {
 before(async () => {
   directory = mkdtempSync(join(tmpdir(), 'sakshi-computer-test-'))
   databasePath = join(directory, 'applications.sqlite')
-  database = openDatabase(databasePath)
-  createOwner(database, ownerUsername, ownerPassword)
-  server = createApp({ database }).listen(0, '127.0.0.1')
+  database = await openDatabase(databasePath)
+  const encodedHash = createPasswordHash(ownerPassword)
+  const [, salt, hash] = encodedHash.split('$')
+  ownerCredentials = { username: ownerUsername, encodedHash, salt, hash }
+  await ensureConfiguredOwner(database, ownerCredentials)
+  server = createApp({
+    database,
+    ownerCredentials,
+    allowedOrigins: [origin, productionOrigin],
+  }).listen(0, '127.0.0.1')
   await new Promise((resolve) => server.once('listening', resolve))
   baseUrl = `http://127.0.0.1:${server.address().port}`
 })
 
 after(async () => {
   if (server) await new Promise((resolve) => server.close(resolve))
-  if (database?.isOpen) database.close()
+  await database?.close()
   rmSync(directory, { recursive: true, force: true })
 })
 
@@ -83,6 +92,133 @@ test('customer and export endpoints require a valid owner session', async () => 
     request('/api/customers/7d7a2bc8-ae6d-4c0e-9d64-61a52b3cc011/export/xlsx'),
   ])
   assert.deepEqual(unauthenticated.map((response) => response.status), [401, 401, 401, 401, 401])
+})
+
+test('HTTP login distinguishes wrong credentials and grants an owner session to valid credentials', async () => {
+  const rejectedOrigin = await request('/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: ownerUsername, password: ownerPassword }),
+  })
+  assert.equal(rejectedOrigin.status, 403)
+
+  const rejectedUntrustedOrigin = await request('/api/auth/login', {
+    method: 'POST',
+    headers: {
+      ...requestHeaders,
+      Origin: 'https://sakshicomputer-banking-manager.onrender.com.attacker.example',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ username: ownerUsername, password: ownerPassword }),
+  })
+  assert.equal(rejectedUntrustedOrigin.status, 403)
+
+  const productionOriginResponse = await request('/api/auth/login', {
+    method: 'POST',
+    headers: {
+      ...requestHeaders,
+      Origin: productionOrigin,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ username: ownerUsername, password: `${ownerPassword}x` }),
+  })
+  assert.equal(productionOriginResponse.status, 401)
+
+  const invalidLogin = await request('/api/auth/login', {
+    method: 'POST',
+    headers: { ...requestHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: ownerUsername, password: `${ownerPassword}x` }),
+  })
+  assert.equal(invalidLogin.status, 401)
+  assert.deepEqual(await invalidLogin.json(), { error: 'Username or password is incorrect.' })
+  assert.ok(invalidLogin.headers.get('x-request-id'))
+
+  const validLogin = await request('/api/auth/login', {
+    method: 'POST',
+    headers: { ...requestHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: ` ${ownerUsername} `, password: ownerPassword }),
+  })
+  assert.equal(validLogin.status, 200)
+  const payload = await validLogin.json()
+  assert.deepEqual(payload, { authenticated: true, username: ownerUsername })
+  const sessionCookie = validLogin.headers.get('set-cookie').split(';')[0]
+
+  const protectedEndpoint = await request('/api/customers', {
+    headers: { Cookie: sessionCookie },
+  })
+  assert.equal(protectedEndpoint.status, 200)
+
+  const logout = await request('/api/auth/logout', {
+    method: 'POST',
+    headers: { ...requestHeaders, Cookie: sessionCookie },
+  })
+  assert.equal(logout.status, 200)
+  const rejectedAfterLogout = await request('/api/customers', {
+    headers: { Cookie: sessionCookie },
+  })
+  assert.equal(rejectedAfterLogout.status, 401)
+})
+
+test('production origin allowlist accepts only the exact Render origin by default', async () => {
+  const previousEnvironment = process.env.NODE_ENV
+  process.env.NODE_ENV = 'production'
+  const productionServer = createApp({
+    database,
+    ownerCredentials,
+    allowedOrigins: [],
+  }).listen(0, '127.0.0.1')
+  await new Promise((resolve) => productionServer.once('listening', resolve))
+  const productionUrl = `http://127.0.0.1:${productionServer.address().port}`
+  try {
+    const acceptedOrigin = await fetch(`${productionUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: {
+        Origin: productionOrigin,
+        'X-Requested-With': 'SakshiComputerUI',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ username: ownerUsername, password: `${ownerPassword}x` }),
+    })
+    assert.equal(acceptedOrigin.status, 401)
+
+    const rejectedLocalOrigin = await fetch(`${productionUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: {
+        Origin: origin,
+        'X-Requested-With': 'SakshiComputerUI',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ username: ownerUsername, password: `${ownerPassword}x` }),
+    })
+    assert.equal(rejectedLocalOrigin.status, 403)
+  } finally {
+    productionServer.closeAllConnections()
+    await new Promise((resolve) => productionServer.close(resolve))
+    if (previousEnvironment === undefined) delete process.env.NODE_ENV
+    else process.env.NODE_ENV = previousEnvironment
+  }
+})
+
+test('AUTH_DEBUG logs only a request ID and authentication failure stage', async () => {
+  const previousDebug = process.env.AUTH_DEBUG
+  const originalWarn = console.warn
+  const messages = []
+  process.env.AUTH_DEBUG = 'true'
+  console.warn = (message) => messages.push(message)
+  try {
+    const response = await request('/api/auth/login', {
+      method: 'POST',
+      headers: { ...requestHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'unknown-fictional-owner', password: ownerPassword }),
+    })
+    assert.equal(response.status, 401)
+    assert.match(messages[0], /^AUTH_DIAGNOSTIC requestId=[0-9a-f-]+ stage=OWNER_NOT_FOUND$/)
+    assert.equal(messages.length, 1)
+  } finally {
+    console.warn = originalWarn
+    if (previousDebug === undefined) delete process.env.AUTH_DEBUG
+    else process.env.AUTH_DEBUG = previousDebug
+  }
 })
 
 test('draft saves, validation, search, editing, statuses, exports and restart persistence work', async () => {
@@ -359,9 +495,10 @@ test('draft saves, validation, search, editing, statuses, exports and restart pe
   assert.equal(accountOpened.accountOpenedOn, '2026-10-26')
 
   await new Promise((resolve) => server.close(resolve))
-  database.close()
-  database = openDatabase(databasePath)
-  server = createApp({ database }).listen(0, '127.0.0.1')
+  await database.close()
+  database = await openDatabase(databasePath)
+  server = createApp({ database, ownerCredentials, allowedOrigins: [origin, productionOrigin] })
+    .listen(0, '127.0.0.1')
   await new Promise((resolve) => server.once('listening', resolve))
   baseUrl = `http://127.0.0.1:${server.address().port}`
 
@@ -399,7 +536,12 @@ test('conditional nominee and minor-applicant details remain separate and valida
 })
 
 test('HTTPS session cookies remain usable and are cleared with the Secure attribute', async () => {
-  const secureServer = createApp({ database, secureCookies: true, allowedOrigins: [origin] })
+  const secureServer = createApp({
+    database,
+    ownerCredentials,
+    secureCookies: true,
+    allowedOrigins: [origin, productionOrigin],
+  })
     .listen(0, '127.0.0.1')
   await new Promise((resolve) => secureServer.once('listening', resolve))
   const secureBaseUrl = `http://127.0.0.1:${secureServer.address().port}`

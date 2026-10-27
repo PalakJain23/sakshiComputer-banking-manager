@@ -9,7 +9,8 @@ import {
   deleteSession,
   findSession,
   SESSION_COOKIE_NAME,
-  verifyOwner,
+  authenticateOwner,
+  readOwnerCredentials,
 } from './database.js'
 import { normalizeRecord, STATUSES, validDate, validateApplicationRecord } from './record-fields.js'
 import { createApplicationPdf, PdfLayoutError } from './exports.js'
@@ -23,6 +24,9 @@ const DEFAULT_ALLOWED_ORIGINS = [
   'http://localhost:4173',
   'http://127.0.0.1:3001',
   'http://localhost:3001',
+]
+const PRODUCTION_ALLOWED_ORIGINS = [
+  'https://sakshicomputer-banking-manager.onrender.com',
 ]
 
 function readSessionToken(request) {
@@ -59,8 +63,9 @@ function toApplication(row) {
   }
 }
 
-function buildRecord(database, id) {
-  const row = database.prepare('SELECT * FROM applications WHERE id = ?').get(id)
+async function buildRecord(database, id) {
+  const result = await database.execute('SELECT * FROM applications WHERE id = ?', [id])
+  const row = result.rows[0]
   return row ? toApplication(row) : null
 }
 
@@ -68,14 +73,22 @@ function isUuid(value) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
 }
 
-export function createApp({ database, secureCookies = process.env.SESSION_COOKIE_SECURE === 'true', allowedOrigins } = {}) {
+export function createApp({
+  database,
+  secureCookies = process.env.SESSION_COOKIE_SECURE === 'true',
+  allowedOrigins,
+  ownerCredentials = readOwnerCredentials(),
+} = {}) {
   if (!database) throw new Error('A database connection is required.')
   const app = express()
-  const originSet = new Set(
-    allowedOrigins
-      || process.env.APP_ORIGINS?.split(',').map((origin) => origin.trim()).filter(Boolean)
-      || DEFAULT_ALLOWED_ORIGINS,
-  )
+  const configuredOrigins = allowedOrigins
+    || process.env.APP_ORIGINS?.split(',').map((origin) => origin.trim()).filter(Boolean)
+    || []
+  const originSet = new Set([
+    ...(process.env.NODE_ENV === 'production' ? [] : DEFAULT_ALLOWED_ORIGINS),
+    ...PRODUCTION_ALLOWED_ORIGINS,
+    ...configuredOrigins,
+  ])
 
   app.disable('x-powered-by')
   app.use((request, response, next) => {
@@ -101,8 +114,8 @@ export function createApp({ database, secureCookies = process.env.SESSION_COOKIE
 
   app.get('/api/health', (_request, response) => response.json({ status: 'ok' }))
 
-  app.get('/api/auth/session', (request, response) => {
-    const session = findSession(database, readSessionToken(request))
+  app.get('/api/auth/session', async (request, response) => {
+    const session = await findSession(database, readSessionToken(request))
     if (!session) return response.json({ authenticated: false })
     response.json({ authenticated: true, username: session.username })
   })
@@ -116,35 +129,58 @@ export function createApp({ database, secureCookies = process.env.SESSION_COOKIE
     message: { error: 'Too many sign-in attempts. Wait 15 minutes and try again.' },
   })
 
-  app.post('/api/auth/login', loginLimiter, (request, response) => {
+  app.post('/api/auth/login', loginLimiter, async (request, response) => {
+    const requestId = randomUUID()
+    response.set('X-Request-ID', requestId)
+    const logAuthFailure = (stage) => {
+      if (process.env.AUTH_DEBUG === 'true') {
+        console.warn(`AUTH_DIAGNOSTIC requestId=${requestId} stage=${stage}`)
+      }
+    }
     const username = typeof request.body?.username === 'string' ? request.body.username : ''
     const password = typeof request.body?.password === 'string' ? request.body.password : ''
     if (username.length > 64 || password.length > 256) {
       return response.status(400).json({ error: 'Enter a valid username and password.' })
     }
-    const owner = verifyOwner(database, username, password)
-    if (!owner) return response.status(401).json({ error: 'Username or password is incorrect.' })
-    const session = createSession(database, owner.id)
+    let authentication
+    try {
+      authentication = await authenticateOwner(database, username, password, ownerCredentials)
+    } catch (error) {
+      logAuthFailure('DATABASE_ERROR')
+      throw error
+    }
+    if (!authentication.owner) {
+      logAuthFailure(authentication.failureStage)
+      return response.status(401).json({ error: 'Username or password is incorrect.' })
+    }
+    let session
+    try {
+      session = await createSession(database, authentication.owner.id)
+    } catch (error) {
+      logAuthFailure('SESSION_ERROR')
+      throw error
+    }
     sendSessionCookie(response, session.token, secureCookies)
-    response.json({ authenticated: true, username: owner.username })
+    response.json({ authenticated: true, username: authentication.owner.username })
   })
 
-  app.post('/api/auth/logout', (request, response) => {
-    deleteSession(database, readSessionToken(request))
+  app.post('/api/auth/logout', async (request, response) => {
+    await deleteSession(database, readSessionToken(request))
     clearSessionCookie(response, secureCookies)
     response.json({ authenticated: false })
   })
 
-  function requireOwner(request, response, next) {
-    const session = findSession(database, readSessionToken(request))
+  async function requireOwner(request, response, next) {
+    const session = await findSession(database, readSessionToken(request))
     if (!session) return response.status(401).json({ error: 'Owner sign-in is required.' })
     request.owner = session
     next()
   }
 
-  app.get('/api/customers', requireOwner, (request, response) => {
+  app.get('/api/customers', requireOwner, async (request, response) => {
     const query = typeof request.query.q === 'string' ? request.query.q.trim().toLocaleLowerCase() : ''
-    const rows = database.prepare('SELECT * FROM applications ORDER BY updated_at DESC').all()
+    const result = await database.execute('SELECT * FROM applications ORDER BY updated_at DESC')
+    const rows = result.rows
     const items = rows.map(toApplication).filter((record) => {
       if (!query) return true
       const fullName = [record.title, record.firstName, record.middleName, record.lastName].filter(Boolean).join(' ')
@@ -153,7 +189,7 @@ export function createApp({ database, secureCookies = process.env.SESSION_COOKIE
     response.json({ items })
   })
 
-  app.post('/api/customers', requireOwner, (request, response) => {
+  app.post('/api/customers', requireOwner, async (request, response) => {
     let data
     try {
       data = normalizeRecord(request.body?.data)
@@ -165,22 +201,23 @@ export function createApp({ database, secureCookies = process.env.SESSION_COOKIE
     }
     const id = randomUUID()
     const now = new Date().toISOString()
-    database.prepare(
+    await database.execute(
       'INSERT INTO applications (id, data, status, submitted_on, created_at, updated_at) VALUES (?, ?, ?, NULL, ?, ?)',
-    ).run(id, JSON.stringify(data), 'Draft', now, now)
-    response.status(201).json({ item: buildRecord(database, id) })
+      [id, JSON.stringify(data), 'Draft', now, now],
+    )
+    response.status(201).json({ item: await buildRecord(database, id) })
   })
 
-  app.get('/api/customers/:id', requireOwner, (request, response) => {
+  app.get('/api/customers/:id', requireOwner, async (request, response) => {
     if (!isUuid(request.params.id)) return response.status(400).json({ error: 'Invalid application ID.' })
-    const item = buildRecord(database, request.params.id)
+    const item = await buildRecord(database, request.params.id)
     if (!item) return response.status(404).json({ error: 'Application not found.' })
     response.json({ item })
   })
 
-  app.put('/api/customers/:id', requireOwner, (request, response) => {
+  app.put('/api/customers/:id', requireOwner, async (request, response) => {
     if (!isUuid(request.params.id)) return response.status(400).json({ error: 'Invalid application ID.' })
-    const existing = buildRecord(database, request.params.id)
+    const existing = await buildRecord(database, request.params.id)
     if (!existing) return response.status(404).json({ error: 'Application not found.' })
     let data
     try {
@@ -195,22 +232,22 @@ export function createApp({ database, secureCookies = process.env.SESSION_COOKIE
     const status = existing.status === 'Form ready' && validateApplicationRecord(data).length
       ? 'Draft'
       : existing.status
-    database.prepare('UPDATE applications SET data = ?, status = ?, updated_at = ? WHERE id = ?').run(
+    await database.execute('UPDATE applications SET data = ?, status = ?, updated_at = ? WHERE id = ?', [
       JSON.stringify(data),
       status,
       updatedAt,
       request.params.id,
-    )
-    response.json({ item: buildRecord(database, request.params.id) })
+    ])
+    response.json({ item: await buildRecord(database, request.params.id) })
   })
 
-  app.patch('/api/customers/:id/status', requireOwner, (request, response) => {
+  app.patch('/api/customers/:id/status', requireOwner, async (request, response) => {
     if (!isUuid(request.params.id)) return response.status(400).json({ error: 'Invalid application ID.' })
     const status = request.body?.status
     if (!['Draft', 'Form ready', 'Submitted', 'Account opened'].includes(status)) {
       return response.status(400).json({ error: 'Choose a valid application status.' })
     }
-    const existing = buildRecord(database, request.params.id)
+    const existing = await buildRecord(database, request.params.id)
     if (!existing) return response.status(404).json({ error: 'Application not found.' })
     if (status === 'Submitted' || status === 'Account opened') {
       return response.status(409).json({ error: 'Use the physical submission or account-opening action to record its date.' })
@@ -227,17 +264,17 @@ export function createApp({ database, secureCookies = process.env.SESSION_COOKIE
         })
       }
     }
-    database.prepare('UPDATE applications SET status = ?, updated_at = ? WHERE id = ?').run(
+    await database.execute('UPDATE applications SET status = ?, updated_at = ? WHERE id = ?', [
       status,
       new Date().toISOString(),
       request.params.id,
-    )
-    response.json({ item: buildRecord(database, request.params.id) })
+    ])
+    response.json({ item: await buildRecord(database, request.params.id) })
   })
 
-  app.post('/api/customers/:id/mark-submitted', requireOwner, (request, response) => {
+  app.post('/api/customers/:id/mark-submitted', requireOwner, async (request, response) => {
     if (!isUuid(request.params.id)) return response.status(400).json({ error: 'Invalid application ID.' })
-    const existing = buildRecord(database, request.params.id)
+    const existing = await buildRecord(database, request.params.id)
     if (!existing) return response.status(404).json({ error: 'Application not found.' })
     if (existing.status !== 'Form ready') {
       return response.status(409).json({ error: 'Mark the application Form ready before recording its physical submission.' })
@@ -246,18 +283,18 @@ export function createApp({ database, secureCookies = process.env.SESSION_COOKIE
     const submittedOn = request.body?.submittedOn
     if (!validDate(submittedOn)) return response.status(400).json({ error: 'Provide a valid physical submission date.' })
     const now = new Date().toISOString()
-    database.prepare('UPDATE applications SET status = ?, submitted_on = ?, updated_at = ? WHERE id = ?').run(
+    await database.execute('UPDATE applications SET status = ?, submitted_on = ?, updated_at = ? WHERE id = ?', [
       'Submitted',
       submittedOn,
       now,
       request.params.id,
-    )
-    response.json({ item: buildRecord(database, request.params.id) })
+    ])
+    response.json({ item: await buildRecord(database, request.params.id) })
   })
 
-  app.post('/api/customers/:id/mark-opened', requireOwner, (request, response) => {
+  app.post('/api/customers/:id/mark-opened', requireOwner, async (request, response) => {
     if (!isUuid(request.params.id)) return response.status(400).json({ error: 'Invalid application ID.' })
-    const existing = buildRecord(database, request.params.id)
+    const existing = await buildRecord(database, request.params.id)
     if (!existing) return response.status(404).json({ error: 'Application not found.' })
     if (existing.status !== 'Submitted') {
       return response.status(409).json({ error: 'Record physical submission before recording the account-opening date.' })
@@ -265,17 +302,18 @@ export function createApp({ database, secureCookies = process.env.SESSION_COOKIE
     if (!validDate(request.body?.accountOpenedOn)) {
       return response.status(400).json({ error: 'Provide a valid account-opening date.' })
     }
-    database.prepare(
+    await database.execute(
       'UPDATE applications SET status = ?, account_opened_on = ?, updated_at = ? WHERE id = ?',
-    ).run('Account opened', request.body.accountOpenedOn, new Date().toISOString(), request.params.id)
-    response.json({ item: buildRecord(database, request.params.id) })
+      ['Account opened', request.body.accountOpenedOn, new Date().toISOString(), request.params.id],
+    )
+    response.json({ item: await buildRecord(database, request.params.id) })
   })
 
   app.use('/api/customers/:id/export', requireOwner)
 
   app.get('/api/customers/:id/export/pdf', async (request, response) => {
     if (!isUuid(request.params.id)) return response.status(400).json({ error: 'Invalid application ID.' })
-    const record = buildRecord(database, request.params.id)
+    const record = await buildRecord(database, request.params.id)
     if (!record) return response.status(404).json({ error: 'Application not found.' })
 
     try {
@@ -297,7 +335,10 @@ export function createApp({ database, secureCookies = process.env.SESSION_COOKIE
   })
 
   const distPath = resolve(fileURLToPath(new URL('../dist', import.meta.url)))
-  if (process.env.NODE_ENV === 'production' && existsSync(distPath)) {
+  if (process.env.NODE_ENV === 'production' && !existsSync(distPath)) {
+    throw new Error('Production frontend build not found. Run `npm run build` before starting the server.')
+  }
+  if (process.env.NODE_ENV === 'production') {
     app.use(express.static(distPath, { index: false }))
     app.use((request, response, next) => {
       if (request.method === 'GET' && request.accepts('html') && !request.path.startsWith('/api/')) {
